@@ -1,36 +1,28 @@
 #include "opentick.h"
 
-#include <ctime>
 #include <iostream>
 
 using namespace opentick;
-using namespace std::chrono;
-
-#define LOG(msg)                                                           \
-  do {                                                                     \
-    auto d =                                                               \
-        duration_cast<nanoseconds>(system_clock::now().time_since_epoch()) \
-            .count();                                                      \
-    time_t t = d / 1000000000;                                             \
-    char buf[80];                                                          \
-    strftime(buf, sizeof(buf), "%H:%M:%S", localtime(&t));                 \
-    auto nsec = d % 1000000000;                                            \
-    sprintf(buf + strlen(buf), ".%09ld", nsec);                            \
-    std::cerr << buf << ": " << msg << std::endl;                          \
-  } while (0)
 
 static const std::string kInsert =
-    "insert into test(sec, interval, tm, open, high, low, close, v, vwap) "
+    "insert into test(sec, interval, tm, open, high, low, close, vol, vwap) "
     "values(?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 int main() {
-  auto conn = Connect("127.0.0.1", 1116);
-  LOG("connected");
+  auto conn = Connection::Create("127.0.0.1", 1116);
+  LOG("connecting");
+  auto err = conn->Start();
+  if (err.empty()) {
+    LOG("connected");
+  } else {
+    LOG(err);
+    return -1;
+  }
   conn->Execute("create database if not exists test");
   conn->Use("test");
   auto res = conn->Execute(R"(
       create table if not exists test(sec int, interval int, tm timestamp, 
-      open double, high double, low double, close double, v double, vwap 
+      open double, high double, low double, close double, vol double, vwap 
       double, primary key(sec, interval, tm))
       )");
   res = conn->Execute("delete from test where sec=?", Args{1});

@@ -10,30 +10,8 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
-
-type adjValue struct {
-	Tm  [2]int64
-	Px  float64
-	Vol float64
-}
-
-type adjCacheS struct {
-	mut    sync.Mutex
-	values map[string]map[int][]adjValue
-}
-
-func (self *adjCacheS) clear(dbName string) {
-	self.mut.Lock()
-	delete(self.values, dbName)
-	self.mut.Unlock()
-}
-
-var adjCache = adjCacheS{
-	values: make(map[string]map[int][]adjValue),
-}
 
 func Resolve(db fdb.Transactor, dbName string, ast *Ast) (stmt interface{}, err error) {
 	if ast.Select != nil {
@@ -96,9 +74,6 @@ func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}) (
 					return
 				}
 			}
-			if dbName == "adj" {
-				return nil, errors.New("adj is reserved")
-			}
 			err = CreateTable(db, dbName, ast.Create.Table)
 		}
 	} else if ast.Drop != nil {
@@ -114,6 +89,8 @@ func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}) (
 			}
 			err = DropTable(db, dbName, ast.Drop.Table.TableName())
 		}
+	} else if ast.AlterTable != nil {
+		err = AlterTable(db, dbName, ast.AlterTable)
 	} else {
 		stmt, err1 := Resolve(db, dbName, ast)
 		if err1 != nil {
@@ -150,7 +127,7 @@ func executeSelect(db fdb.Transactor, stmt *selectStmt, args []interface{}) (res
 			return
 		}
 		res = []([]interface{}){make([]interface{}, len(stmt.Cols))}
-		applyFuncOne(stmt, value)
+		applyFuncOne(db, stmt, value)
 		for i, col := range stmt.Cols {
 			if col.IsKey {
 				res[0][i] = conds[col.Pos].Equal
@@ -189,7 +166,7 @@ func executeSelect(db fdb.Transactor, stmt *selectStmt, args []interface{}) (res
 		}
 		tmpRes[i] = [2]tuple.Tuple{key, value}
 	}
-	applyFunc(stmt, tmpRes)
+	applyFunc(db, stmt, tmpRes)
 	res = make([]([]interface{}), len(recs))
 	for i, tmp := range tmpRes {
 		key, value := tmp[0], tmp[1]
@@ -364,13 +341,15 @@ func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect) (stmt selec
 	}
 	used := make([]bool, len(scheme.Cols))
 	stmt.Cols = make([]*TableColDef, len(ast.Selected.Cols))
-	stmt.Funcs = make([]*string, len(ast.Selected.Cols))
+	stmt.Funcs = make([]*selectFunc, len(ast.Selected.Cols))
 	for j, col := range ast.Selected.Cols {
 		colName := col.Name
 		var funcName *string
+		var params []AstValue
 		if colName == nil {
 			colName = col.Func.Col
 			funcName = col.Func.Name
+			params = col.Func.Params
 		}
 		col, ok := scheme.NameMap[*colName]
 		if !ok {
@@ -396,10 +375,16 @@ func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect) (stmt selec
 				}
 				funcName = &tmp
 			}
+			if tmp == "adj_vol" || tmp == "adj_px" {
+				if params != nil && (len(params) > 1 || params[0].Boolean == nil) {
+					err = errors.New("adj only accept one optional bool params")
+					return
+				}
+			}
+			stmt.Funcs[j] = &selectFunc{*funcName, params}
 		}
-		stmt.Funcs[j] = funcName
 	}
-	getAdjTuples(&stmt)
+	err = getAdjTuples(&stmt)
 	return
 }
 
@@ -410,20 +395,25 @@ type whereStmt interface {
 }
 
 type adjTuple struct {
-	Pos int
-	Adj int
+	Pos      int
+	Adj      int // 1: px, 2: vol
+	Backward bool
+}
+
+type selectFunc struct {
+	Name   string
+	Params []AstValue
 }
 
 type selectStmt struct {
 	Scheme          *TableScheme
 	Conds           []condition    // <= len(Scheme.Keys)
 	Cols            []*TableColDef // nil or len(ast.Selected.Cols)
-	Funcs           []*string
+	Funcs           []*selectFunc
 	NumPlaceholders int
 	Limit           int
 	Reverse         bool
 	Adjs            []adjTuple
-	PosTm           int
 }
 
 func (self *selectStmt) GetNumPlaceholders() int {
@@ -443,6 +433,11 @@ func resolveInsert(db fdb.Transactor, dbName string, ast *AstInsert) (stmt inser
 	scheme := stmt.Scheme
 	if err != nil {
 		return
+	}
+	if ast.Cols == nil {
+		for _, col := range stmt.Scheme.Cols {
+			ast.Cols = append(ast.Cols, col.Name)
+		}
 	}
 	if len(ast.Cols) != len(ast.Values) {
 		err = errors.New("Unmatched column names/values")
@@ -496,6 +491,15 @@ func resolveDelete(db fdb.Transactor, dbName string, ast *AstDelete) (stmt delet
 	}
 	stmt.Conds, stmt.NumPlaceholders, err = resolveWhere(stmt.Scheme, ast.Where)
 	return
+}
+
+func AlterTable(db fdb.Transactor, dbName string, ast *AstAlterTable) (err error) {
+	scheme, err2 := getTableScheme(db, dbName, ast.Table)
+	if err2 != nil {
+		err = err2
+		return
+	}
+	return RenameTableField(db, scheme, *ast.AlterTableType.Rename.A, *ast.AlterTableType.Rename.B)
 }
 
 type deleteStmt struct {
@@ -628,8 +632,28 @@ func getInt(v interface{}) (ret int64, ok bool) {
 	if v1, ok1 := v.(int64); ok1 {
 		return v1, true
 	}
+	if v1, ok1 := v.(int16); ok1 {
+		return int64(v1), true
+	}
+	if v1, ok1 := v.(int8); ok1 {
+		return int64(v1), true
+	}
 	return
 }
+
+func getFloat(v interface{}) (ret float64, ok bool) {
+	if v1, ok1 := v.(float64); ok1 {
+		return v1, true
+	}
+	if v1, ok1 := v.(float32); ok1 {
+		return float64(v1), true
+	}
+	if v1, ok1 := getInt(v); ok1 {
+		return float64(v1), true
+	}
+	return
+}
+
 func validateValue(col *TableColDef, v interface{}) (ret interface{}, err error) {
 	switch col.Type {
 	case TinyInt, SmallInt, Int, BigInt:
@@ -763,25 +787,16 @@ func validateConditionArgs(scheme *TableScheme, origConds []condition, args []in
 	return
 }
 
-func getAdjTuples(stmt *selectStmt) {
+func getAdjTuples(stmt *selectStmt) (err error) {
 	var adjs []adjTuple
-	stmt.PosTm = -1
-	for i, col := range stmt.Scheme.Keys {
-		switch col.Type {
-		case Timestamp:
-			stmt.PosTm = i
-			break
-		}
-	}
-	if stmt.PosTm == -1 {
-		return
-	}
-	for i, funcName := range stmt.Funcs {
-		if funcName == nil {
+	nbackward := 0
+	nforward := 0
+	for i, sfunc := range stmt.Funcs {
+		if sfunc == nil {
 			continue
 		}
 		j := 0
-		switch *funcName {
+		switch sfunc.Name {
 		case "adj_px":
 			j = 1
 		case "adj_vol":
@@ -789,37 +804,30 @@ func getAdjTuples(stmt *selectStmt) {
 		default:
 			continue
 		}
+		var backward bool
+		if sfunc.Params != nil && *sfunc.Params[0].Boolean {
+			backward = true
+			nbackward += 1
+		} else {
+			nforward += 1
+		}
 		stmt.Funcs[i] = nil
 		col := stmt.Cols[i]
 		if !col.IsKey {
-			adjs = append(adjs, adjTuple{int(col.Pos), j})
+			adjs = append(adjs, adjTuple{int(col.Pos), j, backward})
 		}
 	}
 	stmt.Adjs = adjs
-}
-
-func applyFunc(stmt *selectStmt, recs []([2]tuple.Tuple)) {
-	adjs := stmt.Adjs
 	if adjs != nil {
-	}
-}
-
-func applyFuncOne(stmt *selectStmt, value tuple.Tuple) {
-	adjs := stmt.Adjs
-	if adjs != nil {
-	}
-}
-
-func (self *adjCacheS) get(dbName string, sec int) (ret []adjValue) {
-	self.mut.Lock()
-	if values, ok := self.values[dbName]; ok {
-		if ret, ok = values[sec]; ok {
-			return
+		if stmt.Scheme.Keys[0].Type != Int {
+			err = errors.New("The first key of the table must be int for applying adj")
 		}
-	} else {
-		values = make(map[int][]adjValue)
-		self.values[dbName] = values
+		if stmt.Scheme.Keys[len(stmt.Scheme.Keys)-1].Type != Timestamp {
+			err = errors.New("The last key of the table must be timestamp for applying adj")
+		}
+		if nbackward > 0 && nforward > 0 {
+			err = errors.New("Mixed backward and forward adj not allowed")
+		}
 	}
-	self.mut.Unlock()
 	return
 }

@@ -227,7 +227,7 @@ func decodeTableScheme(bytes []byte) *TableScheme {
 
 func CreateAdj(db fdb.Transactor, dbName string) (err error) {
 	stmt, err1 := Parse(`
-	create table "adj"(
+	create table _adj_(
 		sec int,
   	tm timestamp,
 		px double,
@@ -356,6 +356,33 @@ func DropTable(db fdb.Transactor, dbName string, tblName string) (err error) {
 		tr.Clear(dirScheme)
 		_, err = dirTable.Remove(tr, nil)
 		tr.ClearRange(dirTable)
+		return
+	})
+	return
+}
+
+func RenameTableField(db fdb.Transactor, tbl *TableScheme, from string, to string) (err error) {
+	TableSchemeMap.Delete(tbl.DbName + "." + tbl.TblName)
+	// create new table scheme to modify rather than modify older
+	tbl, err = GetTableScheme(db, tbl.DbName, tbl.TblName)
+	if err != nil {
+		return
+	}
+	TableSchemeMap.Delete(tbl.DbName + "." + tbl.TblName)
+	_, dirScheme, err1 := openTable(db, tbl.DbName, tbl.TblName)
+	if err1 != nil {
+		return err1
+	}
+	col, ok := tbl.NameMap[from]
+	if !ok {
+		return errors.New("Column " + from + " does not exist")
+	}
+	if _, ok := tbl.NameMap[to]; ok {
+		return errors.New("Column " + to + " already exists")
+	}
+	col.Name = to // potential bug
+	_, err = db.Transact(func(tr fdb.Transaction) (ret interface{}, err error) {
+		tr.Set(dirScheme, tbl.encode())
 		return
 	})
 	return

@@ -2,13 +2,21 @@
 
 ![OpenTrade Logo](https://github.com/opentradesolutions/opentrade/blob/master/web/img/ot.png)
 
-OpenTick is a fast tick database built on [FoundationDB](https://www.foundationdb.org/).
+OpenTick is a fast tick database for financial timeseries data, built on [FoundationDB](https://www.foundationdb.org/) with simplified SQL layer. 
+
+# Features:
+* Built-in price adjustment support
+* Nanosecond support
+* Python, C++ and Go SDK
+* Both sync and async query
+* Implicit SQL statement prepare
 
 # Installation on Ubuntu
 
 You need to use **Go >=1.11** which has module support.
 
 ```bash
+sudo apt install -y python
 wget https://www.foundationdb.org/downloads/6.0.18/ubuntu/installers/foundationdb-server_6.0.18-1_amd64.deb
 wget https://www.foundationdb.org/downloads/6.0.18/ubuntu/installers/foundationdb-clients_6.0.18-1_amd64.deb
 sudo dpkg -i foundationdb-clients_6.0.18-1_amd64.deb foundationdb-server_6.0.18-1_amd64.deb
@@ -30,6 +38,9 @@ Fore more configuration on FoundationDB, please check [FoundationDB Configuratio
 # Usage
 
 [Python](https://github.com/opentradesolutions/opentick/blob/master/bindings/python/test.py)
+```bash
+pip install opentick
+```
 
 [C++](https://github.com/opentradesolutions/opentick/blob/master/bindings/cpp/test.cc)
 
@@ -68,7 +79,8 @@ user@host:~/opentick/bindings/cpp$ make test
 
 * **Create database and table**
 ```C++
-auto conn = Connect("127.0.0.1", 1116);
+auto conn = Connection::Create("127.0.0.1", 1116);
+conn->Start();
 conn->Execute("create database if not exists test");
 conn->Use("test");
 conn->Execute(R"(
@@ -92,7 +104,7 @@ auto res = conn->Execute(
 * **Insert**
 ```C++
 static const std::string kInsert =
-    "insert into test(sec, interval, tm, open, high, low, close, v, vwap) "
+    "insert into test(sec, interval, tm, open, high, low, close, vol, vwap) "
     "values(?, ?, ?, ?, ?, ?, ?, ?, ?)";
 std::vector<Future> futs;
 for (auto i = 0; i < 1000; ++i) {
@@ -110,3 +122,12 @@ for (auto i = 0; i < 1000; ++i) {
 }
 conn->BatchInsert(kInsert, argss);
 ```
+
+* **Price Adjustments**
+
+```C++
+auto res = conn->Execute(
+        "select tm, adj(open), adj(high), adj(low), adj(close), adj(vol) from test where sec=1 and interval=? limit -2", Args{1});
+```
+
+For more details, please checkout [adj_test.go](https://github.com/opentradesolutions/opentick/blob/master/adj_test.go)
