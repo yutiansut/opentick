@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"github.com/patrickmn/go-cache"
 	"gopkg.in/mgo.v2/bson"
 	"log"
 	"math"
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,12 +23,18 @@ var defaultDBs []fdb.Transactor
 var sNumDatabaseConn = 1
 var sMaxConcurrency = 100
 var sTimeout = 0
+var activeConns int32
+var respCache *cache.Cache
 
 func getDB() fdb.Transactor {
 	return defaultDBs[rand.Intn(sNumDatabaseConn)]
 }
 
-func StartServer(addr string, fdbClusterFile string, numDatabaseConn, maxConcurrency, timeout int) error {
+func StartServer(addr string, fdbClusterFile string, numDatabaseConn, maxConcurrency, timeout int, cacheExpiration float64) error {
+	if cacheExpiration > 0 {
+		log.Println("cache enabled with expiration:", cacheExpiration, "seconds")
+		respCache = cache.New(time.Duration(1000*cacheExpiration)*time.Millisecond, time.Duration(1000*cacheExpiration)*time.Millisecond)
+	}
 	log.SetOutput(os.Stdout)
 	fdb.MustAPIVersion(FdbVersion)
 	if numDatabaseConn > sNumDatabaseConn {
@@ -49,6 +58,7 @@ func StartServer(addr string, fdbClusterFile string, numDatabaseConn, maxConcurr
 			defaultDBs[i] = fdb.MustOpen(fdbClusterFile, []byte("DB"))
 		}
 	}
+	LoadUsers(getDB())
 	laddr, err1 := net.ResolveTCPAddr("tcp", addr)
 	if err1 != nil {
 		return err1
@@ -77,6 +87,7 @@ type connection struct {
 	mutex  sync.Mutex
 	cond   *sync.Cond
 	closed bool
+	user   *User
 }
 
 func (self *connection) Send(msg []byte) {
@@ -85,9 +96,13 @@ func (self *connection) Send(msg []byte) {
 
 func handleConnection(conn net.Conn) {
 	timeout := time.Duration(sTimeout) * time.Second
-	log.Println("New connection from", conn.RemoteAddr())
+	atomic.AddInt32(&activeConns, 1)
+	log.Println("New connection from", conn.RemoteAddr(), ", active:", activeConns)
 	ch := make(chan []byte)
-	client := connection{ch: ch, conn: conn}
+	fromLocal := strings.Contains(conn.RemoteAddr().String(), "127.0.0.1:")
+	user := &User{}
+	user.isAdmin = fromLocal
+	client := connection{ch: ch, conn: conn, user: user}
 	client.cond = sync.NewCond(&client.mutex)
 	defer client.close()
 	go client.writeToConnection()
@@ -152,7 +167,7 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func reply(ticket int, res interface{}, ch chan []byte, useJson bool) {
+func reply(cacheKey string, ticket int, res interface{}, ch chan []byte, useJson bool) {
 	defer func() {
 		if err := recover(); err != nil {
 			// send on closed channel
@@ -160,18 +175,25 @@ func reply(ticket int, res interface{}, ch chan []byte, useJson bool) {
 	}()
 	var data []byte
 	var err error
+	key := "1"
+	if _, ok := res.([]byte); ok {
+		key = "2"
+	}
 	if useJson {
-		data, err = json.Marshal(map[string]interface{}{"0": ticket, "1": res})
+		data, err = json.Marshal(map[string]interface{}{"0": ticket, key: res})
 	} else {
-		data, err = bson.Marshal(map[string]interface{}{"0": ticket, "1": res})
+		data, err = bson.Marshal(map[string]interface{}{"0": ticket, key: res})
 	}
 	if err != nil {
-		reply(ticket, "Internal error: "+err.Error(), ch, useJson)
+		reply("", ticket, "Internal error: "+err.Error(), ch, useJson)
 		return
 	}
 	if len(data) > math.MaxUint32 {
-		reply(ticket, "Results too large", ch, useJson)
+		reply("", ticket, "Results too large", ch, useJson)
 		return
+	}
+	if cacheKey != "" {
+		respCache.SetDefault(cacheKey, data)
 	}
 	var size [4]byte
 	binary.LittleEndian.PutUint32(size[:], uint32(len(data)))
@@ -202,9 +224,8 @@ func (c *connection) writeToConnection() {
 }
 
 func (self *connection) process() {
-	var prepared []interface{}
-	var mut sync.Mutex
-	var dbName string
+	var prepared [][2]interface{}
+	var usedDbName string
 	var useJson bool
 	var unfinished int32
 	for {
@@ -224,6 +245,8 @@ func (self *connection) process() {
 			}
 		}
 		unfinished++
+		user := self.user
+		dbName := usedDbName
 		self.mutex.Unlock()
 		go func() {
 			defer func() {
@@ -236,14 +259,20 @@ func (self *connection) process() {
 			var err error
 			var ok bool
 			var ticket int
+			var cacheKey string
 			var cmd string
 			var sql string
 			var preparedId int
 			var ast *Ast
 			var res interface{}
 			var args []interface{}
+			var toks []string
 			var exists bool
 			var stmt interface{}
+			var cachedSql string
+			var useCache int
+			var schema *TableSchema
+			var schema_res [2][]interface{}
 			if useJson {
 				err = json.Unmarshal(body, &data)
 			} else {
@@ -285,22 +314,34 @@ func (self *connection) process() {
 					res = fmt.Sprint("Invalid sql, expected string or int (prepared id), got ", data["2"])
 					goto reply
 				}
-				mut.Lock()
+				self.mutex.Lock()
 				if preparedId >= len(prepared) {
-					mut.Unlock()
+					self.mutex.Unlock()
 					res = fmt.Sprint("Invalid preparedId ", preparedId)
 					goto reply
 				}
-				stmt = prepared[preparedId]
-				mut.Unlock()
+				stmt = prepared[preparedId][0]
+				cachedSql = prepared[preparedId][1].(string)
+				self.mutex.Unlock()
 			} else if sql == "" {
 				res = "Empty sql"
 				goto reply
 			}
+			useCache, _ = data["4"].(int)
 			if cmd == "run" {
-				if sql != "" {
-					res, err = Execute(getDB(), dbName, sql, args)
+				if stmt == nil {
+					res, err = Execute(getDB(), dbName, sql, args, user)
 				} else {
+					if respCache != nil && useCache > 0 {
+						if _, ok2 := stmt.(selectStmt); ok2 {
+							cacheKey = cachedSql + " " + fmt.Sprint(args) + " " + fmt.Sprint(useJson)
+							if cached, ok3 := respCache.Get(cacheKey); ok3 {
+								res = cached
+								cacheKey = ""
+								goto reply
+							}
+						}
+					}
 					res, err = ExecuteStmt(getDB(), stmt, args)
 				}
 				if err != nil {
@@ -340,17 +381,45 @@ func (self *connection) process() {
 					res = err.Error()
 					goto reply
 				}
-				res, err = Resolve(getDB(), dbName, ast)
+				res, err = Resolve(getDB(), dbName, ast, user)
 				if err != nil {
 					res = err.Error()
 					goto reply
 				}
-				mut.Lock()
-				prepared = append(prepared, res)
+				self.mutex.Lock()
+				prepared = append(prepared, [2]interface{}{res, sql})
 				res = len(prepared) - 1
-				mut.Unlock()
-			} else if cmd == "use" {
-				dbName = sql
+				self.mutex.Unlock()
+			} else if cmd == "login" || cmd == "use" {
+				if cmd == "login" {
+					toks = strings.Split(sql, " ")
+					if len(toks) < 2 || toks[0] == "" || toks[1] == "" {
+						res = "Both username and password required"
+						goto reply
+					}
+					res, _ = userMap.Load(toks[0])
+					if res == nil {
+						res = "Unknown username"
+						goto reply
+					}
+					if !res.(*User).CheckPassword(toks[1]) {
+						res = "Password mismatch"
+						goto reply
+					}
+					self.mutex.Lock()
+					self.user = res.(*User)
+					user = self.user
+					self.mutex.Unlock()
+					if len(toks) == 2 {
+						res = nil
+						goto reply
+					}
+					sql = toks[2]
+				}
+				self.mutex.Lock()
+				usedDbName = sql
+				dbName = usedDbName
+				self.mutex.Unlock()
 				exists, err = HasDatabase(getDB(), dbName)
 				if err != nil {
 					res = err.Error()
@@ -359,11 +428,74 @@ func (self *connection) process() {
 				if !exists {
 					res = dbName + " does not exist"
 				}
+				if GetPerm(dbName, "", user) == NoPerm {
+					res = "No permission"
+				}
+			} else if cmd == "meta" { // retrieve metadata
+				toks = strings.Split(sql, " ")
+				if len(toks) == 0 {
+					res = "Please specify meta command"
+					goto reply
+				}
+				switch toks[0] {
+				case "list_databases":
+					res, err = ListDatabases(getDB())
+					if err != nil {
+						res = err.Error()
+					}
+				case "list_tables":
+					if dbName == "" {
+						res = "Please select database first"
+					} else {
+						res, err = ListTables(getDB(), dbName)
+						if err != nil {
+							res = err.Error()
+						}
+					}
+				case "schema":
+					if len(toks) < 2 {
+						res = "Please specify table name"
+						goto reply
+					}
+					schema, err = GetTableSchema(getDB(), dbName, toks[1])
+					if err != nil {
+						res = err.Error()
+						goto reply
+					}
+					for _, f := range schema.Keys {
+						schema_res[0] = append(schema_res[0], []string{f.Name, f.Type.Name()})
+					}
+					for _, f := range schema.Values {
+						schema_res[1] = append(schema_res[1], []string{f.Name, f.Type.Name()})
+					}
+					res = schema_res
+				case "chgpasswd":
+					if len(toks) < 2 {
+						res = "Please specify new password"
+						goto reply
+					}
+					if user.name == "" {
+						res = "Not logged in"
+						goto reply
+					}
+					err = user.UpdatePasswd(getDB(), toks[1])
+					if err != nil {
+						res = err.Error()
+					}
+				case "reload_users":
+					if !user.isAdmin {
+						res = "No permission"
+					} else {
+						LoadUsers(getDB())
+					}
+				default:
+					res = "Invalid meta command"
+				}
 			} else {
 				res = "Invalid command " + cmd
 			}
 		reply:
-			reply(ticket, res, self.ch, useJson)
+			reply(cacheKey, ticket, res, self.ch, useJson)
 		}()
 	}
 }
@@ -375,7 +507,8 @@ func (self *connection) close() {
 	self.closed = true
 	self.cond.Signal()
 	self.mutex.Unlock()
-	log.Println("Closed connection from", self.conn.RemoteAddr())
+	atomic.AddInt32(&activeConns, -1)
+	log.Println("Closed connection from", self.conn.RemoteAddr(), ", active:", activeConns)
 }
 
 func (self *connection) push(data []byte) {

@@ -32,7 +32,7 @@ func Test_Split(t *testing.T) {
 
 func Test_Server(t *testing.T) {
 	port, _ := freeport.GetFreePort()
-	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0)
+	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0, 0)
 	time.Sleep(100 * time.Millisecond)
 	conn, err := client.Connect("", port, "")
 	assert.Equal(t, nil, err)
@@ -41,8 +41,8 @@ func Test_Server(t *testing.T) {
 	assert.Equal(t, nil, err)
 	conn.Close()
 	conn, err = client.Connect("", port, "test")
-	defer conn.Close()
 	assert.Equal(t, nil, err)
+	defer conn.Close()
 	_, err = conn.Execute("create table if not exists test(a int, primary key(a))")
 	assert.Equal(t, nil, err)
 	_, err = conn.Execute("drop table test")
@@ -87,9 +87,9 @@ func Test_Server(t *testing.T) {
 	assert.Equal(t, "Invalid float64 value (2) for \"tm\" of Timestamp", err.Error())
 	res, err = conn.Execute("select open from test where sec=? and interval=? and tm=?", 1, 2, tm)
 	assert.Equal(t, 0, len(res))
-	_, err = conn.Execute("alter table test rename tm to time")
+	_, err = conn.Execute("alter table test rename column tm to time")
 	assert.Equal(t, nil, err)
-	// scheme is cached, so tm still work even it renamed
+	// schema is cached, so tm still work even it renamed
 	res, err = conn.Execute("select open from test where sec=? and interval=? and tm=?", 1, 2, tm)
 	assert.Equal(t, nil, err)
 	assert.Equal(t, 0, len(res))
@@ -105,7 +105,7 @@ func Test_Server(t *testing.T) {
 
 func Benchmark_client_insert_sync(b *testing.B) {
 	port, _ := freeport.GetFreePort()
-	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0)
+	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0, 0)
 	time.Sleep(100 * time.Millisecond)
 	conn, err := client.Connect("", port, "test")
 	_, err = conn.Execute("create database if not exists test")
@@ -124,7 +124,7 @@ func Benchmark_client_insert_sync(b *testing.B) {
 
 func Benchmark_insert_not_prepared(b *testing.B) {
 	port, _ := freeport.GetFreePort()
-	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0)
+	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0, 0)
 	time.Sleep(100 * time.Millisecond)
 	conn, err := client.Connect("", port, "test")
 	_, err = conn.Execute("create database if not exists test")
@@ -141,7 +141,7 @@ func Benchmark_insert_not_prepared(b *testing.B) {
 
 func Benchmark_insert_prepared(b *testing.B) {
 	port, _ := freeport.GetFreePort()
-	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0)
+	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0, 0)
 	time.Sleep(100 * time.Millisecond)
 	conn, err := client.Connect("", port, "test")
 	_, err = conn.Execute("create database if not exists test")
@@ -156,4 +156,28 @@ func Benchmark_insert_prepared(b *testing.B) {
 		}
 	}
 	conn.Execute("drop table test")
+}
+
+func Test_Server_Cache(t *testing.T) {
+	port, _ := freeport.GetFreePort()
+	go StartServer(":"+strconv.FormatInt(int64(port), 10), "", 1, 0, 0, 0.1)
+	time.Sleep(100 * time.Millisecond)
+	conn, _ := client.Connect("", port, "test")
+	conn.Execute("create database if not exists test")
+	conn.Execute("create table test(sec int, interval int, tm timestamp, open double, high double, low double, close double, v double,vwap double, primary key(sec, interval, tm))")
+	tm := time.Now()
+	conn.Execute("insert into test(sec, interval, tm, open) values(?, ?, ?, ?)", 1, 2, tm, 2.2)
+	conn.Execute("insert into test(sec, interval, tm, open) values(?, ?, ?, ?)", 1, 2, tm.Add(time.Second), 2.2)
+	res, _ := conn.Execute("select * from test where sec=?", 1)
+	assert.Equal(t, 2, len(res))
+	res, _ = conn.Execute("select * from test where sec=? and interval=2 and tm=?", 1, tm)
+	assert.Equal(t, 1, len(res))
+	conn.Execute("delete from test where sec=?", 1)
+	res, _ = conn.Execute("select * from test where sec=?", 1)
+	assert.Equal(t, 2, len(res))
+	res, _ = conn.Execute("select * from test where sec=? and interval=2 and tm=?", 1, tm)
+	assert.Equal(t, 1, len(res))
+	time.Sleep(time.Duration(0.1*1000) * time.Millisecond)
+	res, _ = conn.Execute("select * from test where sec=?", 1)
+	assert.Equal(t, 0, len(res))
 }

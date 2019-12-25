@@ -13,13 +13,13 @@ import (
 	"time"
 )
 
-func Resolve(db fdb.Transactor, dbName string, ast *Ast) (stmt interface{}, err error) {
+func Resolve(db fdb.Transactor, dbName string, ast *Ast, user ...*User) (stmt interface{}, err error) {
 	if ast.Select != nil {
-		return resolveSelect(db, dbName, ast.Select)
+		return resolveSelect(db, dbName, ast.Select, user...)
 	} else if ast.Insert != nil {
-		return resolveInsert(db, dbName, ast.Insert)
+		return resolveInsert(db, dbName, ast.Insert, user...)
 	} else if ast.Delete != nil {
-		return resolveDelete(db, dbName, ast.Delete)
+		return resolveDelete(db, dbName, ast.Delete, user...)
 	}
 	err = errors.New("Only select/insert/delete can be resolved")
 	return
@@ -41,7 +41,7 @@ func ExecuteStmt(db fdb.Transactor, stmt interface{}, args []interface{}) (res [
 	return
 }
 
-func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}) (res [][]interface{}, err error) {
+func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}, user ...*User) (res [][]interface{}, err error) {
 	ast, err1 := Parse(sql)
 	if err1 != nil {
 		return nil, err1
@@ -49,6 +49,10 @@ func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}) (
 
 	if ast.Create != nil {
 		if ast.Create.Database != nil {
+			if len(user) > 0 && !user[0].isAdmin {
+				err = errors.New("No permisssion")
+				return
+			}
 			if ast.Create.Database.IfNotExists != nil {
 				exists, err1 := HasDatabase(db, *ast.Create.Database.Name)
 				if err1 != nil {
@@ -61,6 +65,10 @@ func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}) (
 			}
 			err = CreateDatabase(db, *ast.Create.Database.Name)
 		} else if ast.Create.Table != nil {
+			if GetPerm(dbName, "", user...) != WritablePerm {
+				err = errors.New("No permisssion")
+				return
+			}
 			if ast.Create.Table.IfNotExists != nil {
 				if dbName == "" {
 					dbName = ast.Create.Table.Name.DatabaseName()
@@ -78,21 +86,29 @@ func Execute(db fdb.Transactor, dbName string, sql string, args []interface{}) (
 		}
 	} else if ast.Drop != nil {
 		if ast.Drop.Database != nil {
+			if len(user) > 0 && !user[0].isAdmin {
+				err = errors.New("No permisssion")
+				return
+			}
 			err = DropDatabase(db, *ast.Drop.Database)
 			adjCache.clear(*ast.Drop.Database)
 		} else if ast.Drop.Table != nil {
 			if dbName == "" {
 				dbName = ast.Drop.Table.DatabaseName()
 			}
-			if ast.Drop.Table.TableName() == "adj" {
+			if GetPerm(dbName, ast.Drop.Table.TableName(), user...) != WritablePerm {
+				err = errors.New("No permisssion")
+				return
+			}
+			if ast.Drop.Table.TableName() == "_adj_" {
 				adjCache.clear(dbName)
 			}
 			err = DropTable(db, dbName, ast.Drop.Table.TableName())
 		}
 	} else if ast.AlterTable != nil {
-		err = AlterTable(db, dbName, ast.AlterTable)
+		err = AlterTable(db, dbName, ast.AlterTable, user...)
 	} else {
-		stmt, err1 := Resolve(db, dbName, ast)
+		stmt, err1 := Resolve(db, dbName, ast, user...)
 		if err1 != nil {
 			err = err1
 			return
@@ -154,7 +170,7 @@ func executeSelect(db fdb.Transactor, stmt *selectStmt, args []interface{}) (res
 	}
 	tmpRes := make([][2]tuple.Tuple, len(recs))
 	for i, rec := range recs {
-		key, err1 := stmt.Scheme.Dir.Unpack(rec.Key)
+		key, err1 := stmt.Schema.Dir.Unpack(rec.Key)
 		if err1 != nil {
 			err = errors.New("Internal errror: " + err1.Error())
 			return
@@ -186,8 +202,8 @@ func executeSelect(db fdb.Transactor, stmt *selectStmt, args []interface{}) (res
 }
 
 func executeDelete(db fdb.Transactor, stmt *deleteStmt, args []interface{}) (err error) {
-	if stmt.Scheme.TblName == "adj" {
-		adjCache.clear(stmt.Scheme.DbName)
+	if stmt.Schema.TblName == "_adj_" {
+		adjCache.clear(stmt.Schema.DbName)
 	}
 	tmp, _, err1 := executeWhere(db, stmt, args)
 	if err1 != nil {
@@ -216,15 +232,23 @@ func executeWhere(db fdb.Transactor, stmt whereStmt, args []interface{}) (res in
 		return
 	}
 	conds = stmt.GetConds()
-	scheme := stmt.GetScheme()
+	schema := stmt.GetSchema()
+	if conds == nil {
+		kr := fdb.KeyRange{}
+		a, b := schema.Dir.FDBRangeKeys()
+		kr.Begin = a
+		kr.End = b
+		res = kr
+		return
+	}
 	if len(args) > 0 {
-		conds, err = validateConditionArgs(scheme, conds, args)
+		conds, err = validateConditionArgs(schema, conds, args)
 		if err != nil {
 			return
 		}
 	}
 	var sub subspace.Subspace
-	sub = scheme.Dir
+	sub = schema.Dir
 	n := len(conds) - 1
 	if n > 0 {
 		for i := range conds[:n] {
@@ -232,7 +256,7 @@ func executeWhere(db fdb.Transactor, stmt whereStmt, args []interface{}) (res in
 		}
 	}
 	c := &conds[n]
-	if c.Equal != nil && len(conds) == len(scheme.Keys) {
+	if c.Equal != nil && len(conds) == len(schema.Keys) {
 		res = sub.Sub(c.Equal).Bytes()
 		return
 	}
@@ -275,7 +299,7 @@ func BatchInsert(db fdb.Transactor, stmt *insertStmt, argsArray [][]interface{})
 			if err != nil {
 				return
 			}
-			tr.Set(stmt.Scheme.Dir.Pack(tuple.Tuple(parts[0])), tuple.Tuple(parts[1]).Pack())
+			tr.Set(stmt.Schema.Dir.Pack(tuple.Tuple(parts[0])), tuple.Tuple(parts[1]).Pack())
 		}
 		return
 	})
@@ -293,14 +317,14 @@ func prepareInsert(stmt *insertStmt, args []interface{}, parts *[2][]tuple.Tuple
 		copy(values, stmt.Values)
 		for i := range values {
 			if p, ok := values[i].(placeholder); ok {
-				values[i], err = validateValue(stmt.Scheme.Cols[i], args[int(p)])
+				values[i], err = validateValue(stmt.Schema.Cols[i], args[int(p)])
 				if err != nil {
 					return
 				}
 			}
 		}
 	}
-	for i, cols := range [2]([]*TableColDef){stmt.Scheme.Keys, stmt.Scheme.Values} {
+	for i, cols := range [2]([]*TableColDef){stmt.Schema.Keys, stmt.Schema.Values} {
 		parts[i] = make([]tuple.TupleElement, len(cols))
 		for _, col := range cols {
 			v := values[col.PosCol]
@@ -311,20 +335,24 @@ func prepareInsert(stmt *insertStmt, args []interface{}, parts *[2][]tuple.Tuple
 }
 
 func executeInsert(db fdb.Transactor, stmt *insertStmt, args []interface{}) (err error) {
-	if stmt.Scheme.TblName == "adj" {
-		adjCache.clear(stmt.Scheme.DbName)
+	if stmt.Schema.TblName == "_adj_" {
+		adjCache.clear(stmt.Schema.DbName)
 	}
 	argsArray := [1][]interface{}{args}
 	return BatchInsert(db, stmt, argsArray[:])
 }
 
-func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect) (stmt selectStmt, err error) {
-	stmt.Scheme, err = getTableScheme(db, dbName, ast.Table)
-	scheme := stmt.Scheme
+func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect, user ...*User) (stmt selectStmt, err error) {
+	stmt.Schema, err = getTableSchema(db, dbName, ast.Table)
+	schema := stmt.Schema
 	if err != nil {
 		return
 	}
-	stmt.Conds, stmt.NumPlaceholders, err = resolveWhere(stmt.Scheme, ast.Where)
+	if GetPerm(schema.DbName, schema.TblName, user...) == NoPerm {
+		err = errors.New("No permisssion")
+		return
+	}
+	stmt.Conds, stmt.NumPlaceholders, err = resolveWhere(stmt.Schema, ast.Where)
 	if err != nil {
 		return
 	}
@@ -336,10 +364,10 @@ func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect) (stmt selec
 		}
 	}
 	if ast.Selected.All != nil {
-		stmt.Cols = scheme.Cols
+		stmt.Cols = schema.Cols
 		return
 	}
-	used := make([]bool, len(scheme.Cols))
+	used := make([]bool, len(schema.Cols))
 	stmt.Cols = make([]*TableColDef, len(ast.Selected.Cols))
 	stmt.Funcs = make([]*selectFunc, len(ast.Selected.Cols))
 	for j, col := range ast.Selected.Cols {
@@ -351,7 +379,7 @@ func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect) (stmt selec
 			funcName = col.Func.Name
 			params = col.Func.Params
 		}
-		col, ok := scheme.NameMap[*colName]
+		col, ok := schema.NameMap[*colName]
 		if !ok {
 			err = errors.New("Undefined column name " + *colName)
 			return
@@ -391,7 +419,7 @@ func resolveSelect(db fdb.Transactor, dbName string, ast *AstSelect) (stmt selec
 type whereStmt interface {
 	GetNumPlaceholders() int
 	GetConds() []condition
-	GetScheme() *TableScheme
+	GetSchema() *TableSchema
 }
 
 type adjTuple struct {
@@ -406,8 +434,8 @@ type selectFunc struct {
 }
 
 type selectStmt struct {
-	Scheme          *TableScheme
-	Conds           []condition    // <= len(Scheme.Keys)
+	Schema          *TableSchema
+	Conds           []condition    // <= len(Schema.Keys)
 	Cols            []*TableColDef // nil or len(ast.Selected.Cols)
 	Funcs           []*selectFunc
 	NumPlaceholders int
@@ -424,18 +452,22 @@ func (self *selectStmt) GetConds() []condition {
 	return self.Conds
 }
 
-func (self *selectStmt) GetScheme() *TableScheme {
-	return self.Scheme
+func (self *selectStmt) GetSchema() *TableSchema {
+	return self.Schema
 }
 
-func resolveInsert(db fdb.Transactor, dbName string, ast *AstInsert) (stmt insertStmt, err error) {
-	stmt.Scheme, err = getTableScheme(db, dbName, ast.Table)
-	scheme := stmt.Scheme
+func resolveInsert(db fdb.Transactor, dbName string, ast *AstInsert, user ...*User) (stmt insertStmt, err error) {
+	stmt.Schema, err = getTableSchema(db, dbName, ast.Table)
+	schema := stmt.Schema
 	if err != nil {
 		return
 	}
+	if GetPerm(schema.DbName, schema.TblName, user...) != WritablePerm {
+		err = errors.New("No permisssion")
+		return
+	}
 	if ast.Cols == nil {
-		for _, col := range stmt.Scheme.Cols {
+		for _, col := range stmt.Schema.Cols {
 			ast.Cols = append(ast.Cols, col.Name)
 		}
 	}
@@ -443,9 +475,9 @@ func resolveInsert(db fdb.Transactor, dbName string, ast *AstInsert) (stmt inser
 		err = errors.New("Unmatched column names/values")
 		return
 	}
-	stmt.Values = make([]interface{}, len(scheme.Cols))
+	stmt.Values = make([]interface{}, len(schema.Cols))
 	for j, colName := range ast.Cols {
-		col, ok := scheme.NameMap[colName]
+		col, ok := schema.NameMap[colName]
 		if !ok {
 			err = errors.New("Undefined column name " + colName)
 			return
@@ -466,7 +498,7 @@ func resolveInsert(db fdb.Transactor, dbName string, ast *AstInsert) (stmt inser
 		}
 	}
 	var missed []string
-	for _, col := range scheme.Keys {
+	for _, col := range schema.Keys {
 		if stmt.Values[col.PosCol] == nil {
 			missed = append(missed, col.Name)
 		}
@@ -479,32 +511,40 @@ func resolveInsert(db fdb.Transactor, dbName string, ast *AstInsert) (stmt inser
 }
 
 type insertStmt struct {
-	Scheme          *TableScheme
-	Values          []interface{} // len(Scheme.Cols)
+	Schema          *TableSchema
+	Values          []interface{} // len(Schema.Cols)
 	NumPlaceholders int
 }
 
-func resolveDelete(db fdb.Transactor, dbName string, ast *AstDelete) (stmt deleteStmt, err error) {
-	stmt.Scheme, err = getTableScheme(db, dbName, ast.Table)
+func resolveDelete(db fdb.Transactor, dbName string, ast *AstDelete, user ...*User) (stmt deleteStmt, err error) {
+	stmt.Schema, err = getTableSchema(db, dbName, ast.Table)
 	if err != nil {
 		return
 	}
-	stmt.Conds, stmt.NumPlaceholders, err = resolveWhere(stmt.Scheme, ast.Where)
+	if GetPerm(stmt.Schema.DbName, stmt.Schema.TblName, user...) != WritablePerm {
+		err = errors.New("No permisssion")
+		return
+	}
+	stmt.Conds, stmt.NumPlaceholders, err = resolveWhere(stmt.Schema, ast.Where)
 	return
 }
 
-func AlterTable(db fdb.Transactor, dbName string, ast *AstAlterTable) (err error) {
-	scheme, err2 := getTableScheme(db, dbName, ast.Table)
+func AlterTable(db fdb.Transactor, dbName string, ast *AstAlterTable, user ...*User) (err error) {
+	schema, err2 := getTableSchema(db, dbName, ast.Table)
 	if err2 != nil {
 		err = err2
 		return
 	}
-	return RenameTableField(db, scheme, *ast.AlterTableType.Rename.A, *ast.AlterTableType.Rename.B)
+	if GetPerm(schema.DbName, schema.TblName, user...) != WritablePerm {
+		err = errors.New("No permisssion")
+		return
+	}
+	return RenameTable(db, schema, ast.AlterTableType.Rename.ColOldNewName, ast.AlterTableType.Rename.NewTableName)
 }
 
 type deleteStmt struct {
-	Scheme          *TableScheme
-	Conds           []condition // <= len(Scheme.Keys)
+	Schema          *TableSchema
+	Conds           []condition // <= len(Schema.Keys)
 	NumPlaceholders int
 }
 
@@ -516,8 +556,8 @@ func (self *deleteStmt) GetConds() []condition {
 	return self.Conds
 }
 
-func (self *deleteStmt) GetScheme() *TableScheme {
-	return self.Scheme
+func (self *deleteStmt) GetSchema() *TableSchema {
+	return self.Schema
 }
 
 type placeholder int
@@ -536,10 +576,13 @@ func (self *condition) IsRange() bool {
 	return self.End[0] != nil || self.Start[0] != nil
 }
 
-func resolveWhere(scheme *TableScheme, where *AstExpression) (conds []condition, numPlaceholder int, err error) {
-	conds = make([]condition, len(scheme.Keys))
+func resolveWhere(schema *TableSchema, where *AstExpression) (conds []condition, numPlaceholder int, err error) {
+	if where == nil {
+		return
+	}
+	conds = make([]condition, len(schema.Keys))
 	for _, cond := range where.And {
-		col, ok := scheme.NameMap[*cond.LHS]
+		col, ok := schema.NameMap[*cond.LHS]
 		if !ok {
 			err = errors.New("Undefined column name " + *cond.LHS)
 			return
@@ -747,24 +790,25 @@ hasError:
 	return
 }
 
-func getTableScheme(db fdb.Transactor, dbName string, table *AstTableName) (scheme *TableScheme, err error) {
-	if dbName == "" {
-		dbName = table.DatabaseName()
+func getTableSchema(db fdb.Transactor, dbName string, table *AstTableName) (schema *TableSchema, err error) {
+	tmp := table.DatabaseName()
+	if dbName == "" || tmp != "" {
+		dbName = tmp
 	}
 	if dbName == "" {
 		err = errors.New("No database name has been specified. USE a database name, or explicitly specify databasename.tablename")
 		return
 	}
-	scheme, err = GetTableScheme(db, dbName, table.TableName())
+	schema, err = GetTableSchema(db, dbName, table.TableName())
 	return
 }
 
-func validateConditionArgs(scheme *TableScheme, origConds []condition, args []interface{}) (conds []condition, err error) {
+func validateConditionArgs(schema *TableSchema, origConds []condition, args []interface{}) (conds []condition, err error) {
 	conds = make([]condition, len(origConds))
 	copy(conds, origConds)
 	for i := range conds {
 		cond := &conds[i]
-		col := scheme.Keys[i]
+		col := schema.Keys[i]
 		if p, ok := cond.Equal.(placeholder); ok {
 			cond.Equal, err = validateValue(col, args[int(p)])
 			if err != nil {
@@ -819,10 +863,10 @@ func getAdjTuples(stmt *selectStmt) (err error) {
 	}
 	stmt.Adjs = adjs
 	if adjs != nil {
-		if stmt.Scheme.Keys[0].Type != Int {
+		if stmt.Schema.Keys[0].Type != Int {
 			err = errors.New("The first key of the table must be int for applying adj")
 		}
-		if stmt.Scheme.Keys[len(stmt.Scheme.Keys)-1].Type != Timestamp {
+		if stmt.Schema.Keys[len(stmt.Schema.Keys)-1].Type != Timestamp {
 			err = errors.New("The last key of the table must be timestamp for applying adj")
 		}
 		if nbackward > 0 && nforward > 0 {

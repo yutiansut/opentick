@@ -12,7 +12,7 @@ import (
 type DataType uint32
 
 var FdbVersion = 520
-var TableSchemeMap = sync.Map{}
+var TableSchemaMap = sync.Map{}
 
 const (
 	TinyInt DataType = iota
@@ -29,7 +29,11 @@ const (
 var typeNames = []string{"TinyInt", "SmallInt", "Int", "BigInt", "Double", "Float", "Timestamp", "Boolean", "Text"}
 
 func (self *DataType) Name() string {
-	return typeNames[int(*self)]
+	i := int(*self)
+	if i >= len(typeNames) {
+		return ""
+	}
+	return typeNames[i]
 }
 
 func HasDatabase(db fdb.Transactor, dbName string) (bool, error) {
@@ -59,6 +63,21 @@ func CreateDatabase(db fdb.Transactor, dbName string) (err error) {
 		return
 	}
 	CreateAdj(db, dbName)
+	return
+}
+
+func ListDatabases(db fdb.Transactor) (dbNames []string, err error) {
+	path := []string{"db"}
+	dir, err1 := directory.Open(db, path, nil)
+	if err1 != nil {
+		err = err1
+		return
+	}
+	if dir == nil {
+		err = errors.New("Database dir does not exist")
+		return
+	}
+	dbNames, err = dir.List(db, nil)
 	return
 }
 
@@ -123,7 +142,7 @@ func NewTableColDef(name string, t DataType) (tbl *TableColDef) {
 	return
 }
 
-const schemeVersion uint32 = 1
+const schemaVersion uint32 = 1
 
 func (self *TableColDef) encode() []byte {
 	var out []byte
@@ -144,7 +163,7 @@ func decodeTableColDef(bytes []byte, out *TableColDef, version uint32) []byte {
 	return bytes[4:]
 }
 
-type TableScheme struct {
+type TableSchema struct {
 	DbName  string
 	TblName string
 	Cols    []*TableColDef
@@ -154,7 +173,7 @@ type TableScheme struct {
 	Dir     directory.DirectorySubspace
 }
 
-func NewTableScheme(cols []*TableColDef, keys []int) (tbl TableScheme) {
+func NewTableSchema(cols []*TableColDef, keys []int) (tbl TableSchema) {
 	tbl.Cols = cols
 	tbl.Keys = make([]*TableColDef, len(keys))
 	for i := range keys {
@@ -164,7 +183,7 @@ func NewTableScheme(cols []*TableColDef, keys []int) (tbl TableScheme) {
 	return
 }
 
-func (self *TableScheme) fill() {
+func (self *TableSchema) fill() {
 	self.Values = make([]*TableColDef, len(self.Cols)-len(self.Keys))
 	for i, col := range self.Keys {
 		col.IsKey = true
@@ -183,11 +202,11 @@ func (self *TableScheme) fill() {
 	}
 }
 
-func (self *TableScheme) encode() []byte {
+func (self *TableSchema) encode() []byte {
 	var out []byte
 	var tmp [4]byte
 	bn := tmp[:]
-	binary.BigEndian.PutUint32(bn, schemeVersion)
+	binary.BigEndian.PutUint32(bn, schemaVersion)
 	out = bn
 	binary.BigEndian.PutUint32(bn, uint32(len(self.Cols)))
 	out = append(out, bn...)
@@ -203,7 +222,7 @@ func (self *TableScheme) encode() []byte {
 	return out
 }
 
-func decodeTableScheme(bytes []byte) *TableScheme {
+func decodeTableSchema(bytes []byte) *TableSchema {
 	v := binary.BigEndian.Uint32(bytes)
 	bytes = bytes[4:]
 	n := binary.BigEndian.Uint32(bytes)
@@ -220,7 +239,7 @@ func decodeTableScheme(bytes []byte) *TableScheme {
 		keys[i] = cols[int(binary.BigEndian.Uint32(bytes))]
 		bytes = bytes[4:]
 	}
-	tbl := TableScheme{Cols: cols, Keys: keys}
+	tbl := TableSchema{Cols: cols, Keys: keys}
 	tbl.fill()
 	return &tbl
 }
@@ -229,10 +248,10 @@ func CreateAdj(db fdb.Transactor, dbName string) (err error) {
 	stmt, err1 := Parse(`
 	create table _adj_(
 		sec int,
-  	tm timestamp,
+  	time timestamp,
 		px double,
 		vol double,
-		primary key (sec, tm)
+		primary key (sec, time)
 	)
   `)
 	if err1 != nil {
@@ -272,7 +291,7 @@ func CreateTable(db fdb.Transactor, dbName string, ast *AstCreateTable) (err err
 	}
 	m := map[string]typeTuple{}
 	var keyStrs []string
-	tbl := TableScheme{}
+	tbl := TableSchema{}
 	for _, f := range ast.Cols {
 		if f.Key != nil {
 			if keyStrs != nil {
@@ -314,19 +333,19 @@ func CreateTable(db fdb.Transactor, dbName string, ast *AstCreateTable) (err err
 			err = err2
 			return
 		}
-		dirScheme, err3 := dirTable.Create(tr, []string{"scheme"}, nil)
+		dirSchema, err3 := dirTable.Create(tr, []string{"scheme"}, nil)
 		if err3 != nil {
 			err = err3
 			return
 		}
 		tbl.fill()
-		tr.Set(dirScheme, tbl.encode())
+		tr.Set(dirSchema, tbl.encode())
 		return
 	})
 	return
 }
 
-func openTable(db fdb.Transactor, dbName string, tblName string) (dirTable directory.DirectorySubspace, dirScheme directory.DirectorySubspace, err error) {
+func openTable(db fdb.Transactor, dbName string, tblName string) (dirTable directory.DirectorySubspace, dirSchema directory.DirectorySubspace, err error) {
 	pathTable := []string{"db", dbName, tblName}
 	var exists bool
 	exists, err = directory.Exists(db, pathTable)
@@ -341,19 +360,19 @@ func openTable(db fdb.Transactor, dbName string, tblName string) (dirTable direc
 	if err != nil {
 		return
 	}
-	dirScheme, err = dirTable.Open(db, []string{"scheme"}, nil)
+	dirSchema, err = dirTable.Open(db, []string{"scheme"}, nil)
 	return
 }
 
 func DropTable(db fdb.Transactor, dbName string, tblName string) (err error) {
-	TableSchemeMap.Delete(dbName + "." + tblName)
-	dirTable, dirScheme, err1 := openTable(db, dbName, tblName)
+	TableSchemaMap.Delete(dbName + "." + tblName)
+	dirTable, dirSchema, err1 := openTable(db, dbName, tblName)
 	if err1 != nil {
 		err = err1
 		return
 	}
 	_, err = db.Transact(func(tr fdb.Transaction) (ret interface{}, err error) {
-		tr.Clear(dirScheme)
+		tr.Clear(dirSchema)
 		_, err = dirTable.Remove(tr, nil)
 		tr.ClearRange(dirTable)
 		return
@@ -361,18 +380,28 @@ func DropTable(db fdb.Transactor, dbName string, tblName string) (err error) {
 	return
 }
 
-func RenameTableField(db fdb.Transactor, tbl *TableScheme, from string, to string) (err error) {
-	TableSchemeMap.Delete(tbl.DbName + "." + tbl.TblName)
-	// create new table scheme to modify rather than modify older
-	tbl, err = GetTableScheme(db, tbl.DbName, tbl.TblName)
+func RenameTable(db fdb.Transactor, tbl *TableSchema, colOldNewName []string, newTableName *string) (err error) {
+	// create new table schema to modify rather than modify older
+	tbl, err = GetTableSchema(db, tbl.DbName, tbl.TblName)
 	if err != nil {
 		return
 	}
-	TableSchemeMap.Delete(tbl.DbName + "." + tbl.TblName)
-	_, dirScheme, err1 := openTable(db, tbl.DbName, tbl.TblName)
+	TableSchemaMap.Delete(tbl.DbName + "." + tbl.TblName)
+	if newTableName != nil {
+		oldPathTable := []string{"db", tbl.DbName, tbl.TblName}
+		newPathTable := []string{"db", tbl.DbName, *newTableName}
+		_, err = directory.Move(db, oldPathTable, newPathTable)
+		tbl, err = GetTableSchema(db, tbl.DbName, tbl.TblName)
+		return
+	}
+	// rename col name below
+	from := colOldNewName[0]
+	to := colOldNewName[1]
+	_, dirSchema, err1 := openTable(db, tbl.DbName, tbl.TblName)
 	if err1 != nil {
 		return err1
 	}
+	tbl = decodeTableSchema(tbl.encode()) //  modify copied to avoid thread issue
 	col, ok := tbl.NameMap[from]
 	if !ok {
 		return errors.New("Column " + from + " does not exist")
@@ -380,9 +409,9 @@ func RenameTableField(db fdb.Transactor, tbl *TableScheme, from string, to strin
 	if _, ok := tbl.NameMap[to]; ok {
 		return errors.New("Column " + to + " already exists")
 	}
-	col.Name = to // potential bug
+	col.Name = to
 	_, err = db.Transact(func(tr fdb.Transaction) (ret interface{}, err error) {
-		tr.Set(dirScheme, tbl.encode())
+		tr.Set(dirSchema, tbl.encode())
 		return
 	})
 	return
@@ -412,30 +441,30 @@ func parseDataType(typeStr string) (d DataType) {
 	return
 }
 
-func GetTableScheme(db fdb.Transactor, dbName string, tblName string) (tbl *TableScheme, err error) {
+func GetTableSchema(db fdb.Transactor, dbName string, tblName string) (tbl *TableSchema, err error) {
 	fullName := dbName + "." + tblName
-	tmp, _ := TableSchemeMap.Load(fullName)
+	tmp, _ := TableSchemaMap.Load(fullName)
 	if tmp != nil {
-		tbl = tmp.(*TableScheme)
+		tbl = tmp.(*TableSchema)
 		return
 	}
-	dirTable, dirScheme, err1 := openTable(db, dbName, tblName)
+	dirTable, dirSchema, err1 := openTable(db, dbName, tblName)
 	if err1 != nil {
 		err = err1
 		return
 	}
 	ret, err1 := db.Transact(func(tr fdb.Transaction) (ret interface{}, err error) {
-		ret = decodeTableScheme(tr.Get(dirScheme).MustGet())
+		ret = decodeTableSchema(tr.Get(dirSchema).MustGet())
 		return
 	})
 	if err1 != nil {
 		err = err1
 		return
 	}
-	tbl = ret.(*TableScheme)
+	tbl = ret.(*TableSchema)
 	tbl.Dir = dirTable
 	tbl.DbName = dbName
 	tbl.TblName = tblName
-	TableSchemeMap.Store(fullName, tbl)
+	TableSchemaMap.Store(fullName, tbl)
 	return
 }

@@ -3,6 +3,7 @@
 
 import datetime
 import sys
+import hashlib
 import socket
 import struct
 from six.moves import xrange
@@ -12,6 +13,7 @@ import threading
 import pytz
 import time
 import logging
+from numbers import Number
 
 fromtimestamp = datetime.datetime.fromtimestamp
 utc_start = fromtimestamp(0, pytz.utc)
@@ -40,13 +42,46 @@ class _PleaseReconnect(Exception):
   pass
 
 
+# add can be host or url like user_name:password@host:port/db_name
+def connect(addr='localhost',
+            port=None,
+            db_name=None,
+            username=None,
+            password=None,
+            timeout=15):
+  conn = Connection(addr, port, db_name, username, password, timeout)
+  conn.start()
+  return conn
+
+
 class Connection(threading.Thread):
 
-  def __init__(self, addr, port, db_name=None, timeout=15):
+  def __init__(self,
+               addr,
+               port=None,
+               db_name=None,
+               username=None,
+               password=None,
+               timeout=15):
     threading.Thread.__init__(self)
-    self.__addr = addr
-    self.__port = port
+    toks = addr.split('/')
+    if db_name is None and len(toks) > 1: db_name = toks[1]
+    toks = toks[0].split('@')
+    if len(toks) > 1:
+      addr = toks[1]
+      toks = toks[0].split(':')
+      if password is None and len(toks) > 1: password = toks[1]
+      if username is None: username = toks[0]
+    else:
+      addr = toks[0]
+    toks = addr.split(':')
+    host = toks[0]
+    if port is None and len(toks) > 1: port = int(toks[1])
+    self.__addr = host
+    self.__port = port or 1116
     self.__db_name = db_name
+    self.__username = username
+    self.__password = password
     self.__sock = None
     self.__prepared = {}
     self.__auto_reconnect = 1
@@ -74,13 +109,88 @@ class Connection(threading.Thread):
   def set_auto_reconnect(self, interval):
     self.__auto_reconnect = interval
 
+  def login(self, username, password, db_name=None, wait=True):
+    # __username/__password/__db_name not thread safe
+    self.__username = username
+    self.__password = password
+    args = [username, password]
+    if db_name:
+      self.__db_name = db_name
+      args.append(db_name)
+    return self.__send_cmd('login', ' '.join(args), wait)
+
+  def delete_user(self, username):
+    self.execute('delete from _meta_.user where name=\'' + username + '\'')
+    self.reload_users()
+
+  def create_user(self, username, password):
+    assert (username and password)
+    res = self.execute('select * from _meta_.user where name=\'' + username +
+                       '\'')
+    if res and res[0]:
+      raise Error('User already exist')
+    h = hashlib.sha1()
+    h.update(six.b(password))
+    print(h.hexdigest())
+    self.execute("insert into _meta_.user values('%s', '%s', false, '')" %
+                 (username, h.hexdigest()))
+    self.reload_users()
+
+  def list_users(self):
+    return self.execute('select * from _meta_.user')
+
+  def update_user(self, username, perm=None, is_admin=None):
+    res = self.execute('select * from _meta_.user where name=\'' + username +
+                       '\'')
+    if not res or not res[0]:
+      raise Error('User not exist')
+    if perm is not None:
+      if isinstance(perm, str):
+        res[0][-1] = perm
+      elif isinstance(perm, dict):
+        orig = dict([
+            x for x in [x.split('=') for x in res[0][-1].split(';')]
+            if len(x) == 2
+        ])
+        for k, v in perm.items():
+          if v is None:
+            if k in orig: del orig[k]
+          elif v in ('write', 'read'):
+            orig[k] = v
+          else:
+            raise ('Invalid perm type: ' + str(v))
+        res[0][-1] = ';'.join(['%s=%s' % (a, b) for a, b in orig.items()])
+    if is_admin is not None: res[0][-2] = is_admin
+    self.execute('insert into _meta_.user values(?, ?, ?, ?)', res[0])
+    self.reload_users()
+
+  def reload_users(self):
+    self.__send_cmd('meta', 'reload_users')
+
+  def chgpasswd(self, password, wait=True):
+    assert (password)
+    return self.__send_cmd('meta', 'chgpasswd ' + password, wait)
+
   def use(self, db_name, wait=True):
+    # __db_name not thread safe
+    self.__db_name = db_name
+    return self.__send_cmd('use', db_name, wait)
+
+  def list_databases(self):
+    return self.__send_cmd('meta', 'list_databases')
+
+  def list_tables(self):
+    return self.__send_cmd('meta', 'list_tables')
+
+  def schema(self, table_name):
+    return self.__send_cmd('meta', 'schema ' + table_name)
+
+  def __send_cmd(self, cmd, arg, wait=True):
     ticket = self.__get_ticket()
-    cmd = {'0': ticket, '1': 'use', '2': db_name}
-    self.__send(cmd)
-    if not wait: return
+    self.__send({'0': ticket, '1': cmd, '2': arg})
+    if not wait: return Future(ticket, self)
     try:
-      Future(ticket, self).get(self.__default_timeout)
+      return Future(ticket, self).get(self.__default_timeout)
     except Error as e:
       raise e
 
@@ -89,35 +199,56 @@ class Connection(threading.Thread):
     self.__close_socket()
     self.join()
 
-  def execute(self, sql, args=[]):
+  def execute(self, sql, args=[], cache=True):
     if len(args) > 0:
       if isinstance(args[-1], tuple) or isinstance(args[-1], list):
         if isinstance(args[-1][0], tuple) or isinstance(args[-1][0], list):
-          return self.__execute_ranges_async(sql, args).get(
-              self.__default_timeout)
-    return self.execute_async(sql, args).get(self.__default_timeout)
+          return self.__execute_ranges_async(sql, args,
+                                             cache).get(self.__default_timeout)
+    return self.execute_async(sql, args, cache).get(self.__default_timeout)
 
-  def execute_async(self, sql, args=[]):
+  def execute_async(self, sql, args=[], cache=True):
     prepared = None
     if len(args) > 0:
       if isinstance(args[-1], tuple) or isinstance(args[-1], list):
         if isinstance(args[-1][0], tuple) or isinstance(args[-1][0], list):
-          return self.__execute_ranges_async(sql, args)
+          return self.__execute_ranges_async(sql, args, cache)
       args = list(args)
       self.__convert_timestamp(args)
       prepared = self.__prepare(sql)
     ticket = self.__get_ticket()
     cmd = {'0': ticket, '1': 'run', '2': sql, '3': args}
+    if cache: cmd['4'] = 1
     if prepared != None:
       cmd['2'] = prepared
     self.__send(cmd)
     return Future(ticket, self)
 
-  def batch_insert(self, sql, argsArray):
-    fut = self.batch_insert_async(sql, argsArray)
-    fut.get(self.__default_timeout)
+  def batch_insert(self, sql, argsArray, batch_size=None,
+                   batch_one_by_one=True):
+    if batch_size and batch_one_by_one:
+      while argsArray:
+        x = argsArray[:batch_size]
+        self.batch_insert(sql, x)
+        argsArray = argsArray[batch_size:]
+      return
 
-  def batch_insert_async(self, sql, argsArray):
+    fut = self.batch_insert_async(sql, argsArray, batch_size)
+    if batch_size:
+      assert (not batch_one_by_one)
+      [f.get(self.__default_timeout) for f in fut]
+    else:
+      fut.get(self.__default_timeout)
+
+  def batch_insert_async(self, sql, argsArray, batch_size=None):
+    if batch_size:
+      futs = []
+      while argsArray:
+        x = argsArray[:batch_size]
+        futs.append(self.batch_insert_async(sql, x))
+        argsArray = argsArray[batch_size:]
+      return futs
+
     if not argsArray:
       raise Error('argsArray required')
     for args in argsArray:
@@ -143,15 +274,17 @@ class Connection(threading.Thread):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, timeval)
     logging.info('OpenTick: connected')
     self.__connected = True
-    if self.__db_name:
+    if self.__username:
+      self.login(self.__username, self.__password, self.__db_name, sync)
+    elif self.__db_name:
       self.use(self.__db_name, sync)
 
-  def __execute_ranges_async(self, sql, args):
+  def __execute_ranges_async(self, sql, args, cache=True):
     ranges = args[-1]
     futs = []
     for r in ranges:
       args2 = list(args[:-1]) + r
-      futs.append(self.execute_async(sql, args2))
+      futs.append(self.execute_async(sql, args2, cache))
     return Futures(futs)
 
   def __convert_timestamp(self, args):
@@ -233,6 +366,10 @@ class Connection(threading.Thread):
             raise _PleaseReconnect()
           continue
         msg = BSON(body).decode()
+        cached = msg.get('2')
+        if cached is not None:
+          msg['1'] = BSON(cached).decode()['1']
+          del msg['2']
         self.__notify(msg['0'], msg)
       except _PleaseReconnect as e:
         if self.__auto_reconnect < 1: return
@@ -330,7 +467,8 @@ class Future(object):
           if isinstance(rec, list):
             for i in xrange(len(rec)):
               v = rec[i]
-              if isinstance(v, list) and len(v) == 2:
+              if isinstance(v, list) and len(v) == 2 and isinstance(
+                  v[0], Number):
                 rec[i] = fromtimestamp(v[0], pytz.utc) + \
                   datetime.timedelta(microseconds=v[1] / 1000)
       return msg

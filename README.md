@@ -10,6 +10,8 @@ OpenTick is a fast tick database for financial timeseries data, built on [Founda
 * Python, C++ and Go SDK
 * Both sync and async query
 * Implicit SQL statement prepare
+* Permission 
+* Cache
 
 # Installation on Ubuntu
 
@@ -17,9 +19,9 @@ You need to use **Go >=1.11** which has module support.
 
 ```bash
 sudo apt install -y python
-wget https://www.foundationdb.org/downloads/6.0.18/ubuntu/installers/foundationdb-server_6.0.18-1_amd64.deb
-wget https://www.foundationdb.org/downloads/6.0.18/ubuntu/installers/foundationdb-clients_6.0.18-1_amd64.deb
-sudo dpkg -i foundationdb-clients_6.0.18-1_amd64.deb foundationdb-server_6.0.18-1_amd64.deb
+wget https://www.foundationdb.org/downloads/6.2.10/ubuntu/installers/foundationdb-server_6.2.10-1_amd64.deb
+wget https://www.foundationdb.org/downloads/6.2.10/ubuntu/installers/foundationdb-clients_6.2.10-1_amd64.deb
+sudo dpkg -i foundationdb-clients_6.2.10-1_amd64.deb foundationdb-server_6.2.10-1_amd64.deb
 git clone https://github.com/opentradesolutions/opentick
 make build
 sudo apt install nodejs
